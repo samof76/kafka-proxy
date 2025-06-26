@@ -1,9 +1,13 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"log/slog"
+	"path"
 	"runtime"
+	"strings"
 
 	"github.com/grepplabs/kafka-proxy/config"
 	"github.com/grepplabs/kafka-proxy/proxy"
@@ -11,6 +15,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	sloglogrus "github.com/samber/slog-logrus/v2"
+	"github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/sasl"
+	"github.com/segmentio/kafka-go/sasl/scram"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 
@@ -24,7 +31,6 @@ import (
 	"time"
 
 	"errors"
-	"strings"
 
 	"github.com/grepplabs/kafka-proxy/pkg/apis"
 	localauth "github.com/grepplabs/kafka-proxy/plugin/local-auth/shared"
@@ -99,6 +105,10 @@ func initFlags() {
 
 	Server.Flags().IntVar(&c.Proxy.RequestBufferSize, "proxy-request-buffer-size", 4096, "Request buffer size pro tcp connection")
 	Server.Flags().IntVar(&c.Proxy.ResponseBufferSize, "proxy-response-buffer-size", 4096, "Response buffer size pro tcp connection")
+	Server.Flags().DurationVar(&c.Proxy.ShutdownTimeout, "proxy-shutdown-timeout", 30*time.Second, "Maximum time to wait for in-flight connections to complete during graceful shutdown")
+	Server.Flags().StringVar(&c.Proxy.ReadinessServiceName, "proxy-readiness-service-name", "", "Service name/address for readiness check (if empty, uses first bootstrap server)")
+	Server.Flags().StringVar(&c.Proxy.ReadinessUsername, "proxy-readiness-username", "", "Username for readiness probe SASL authentication")
+	Server.Flags().StringVar(&c.Proxy.ReadinessPassword, "proxy-readiness-password", os.Getenv("PROXY_READINESS_PASSWORD"), "Password for readiness probe SASL authentication")
 
 	Server.Flags().IntVar(&c.Proxy.ListenerReadBufferSize, "proxy-listener-read-buffer-size", 0, "Size of the operating system's receive buffer associated with the connection. If zero, system default is used")
 	Server.Flags().IntVar(&c.Proxy.ListenerWriteBufferSize, "proxy-listener-write-buffer-size", 0, "Sets the size of the operating system's transmit buffer associated with the connection. If zero, system default is used")
@@ -226,6 +236,8 @@ func initFlags() {
 
 func Run(_ *cobra.Command, _ []string) {
 	logrus.Infof("Starting kafka-proxy version %s on platform %s/%s", config.Version, runtime.GOOS, runtime.GOARCH)
+	pid := os.Getpid()
+	log.Printf("Process ID (PID): %d", pid)
 
 	var localPasswordAuthenticator apis.PasswordAuthenticator
 	var localTokenAuthenticator apis.TokenInfo
@@ -404,7 +416,11 @@ func Run(_ *cobra.Command, _ []string) {
 			logrus.Print("Ready for new connections")
 			return proxyClient.Run(connSrc)
 		}, func(error) {
+			logrus.Info("Closing client")
 			proxyClient.Close()
+			logrus.Info("Waiting for in-flight connections to drain")
+			proxyClient.Wait() // Wait for draining
+			logrus.Info("Done waiting for in-flight connections to drain")
 		})
 	}
 	{
@@ -468,24 +484,148 @@ func NewHTTPHandler() http.Handler {
 	m.HandleFunc(c.Http.HealthPath, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`OK`))
 	})
+	m.HandleFunc("/ready", readinessHandler)
 	m.Handle(c.Http.MetricsPath, promhttp.Handler())
 
 	return m
 }
 
+// readinessHandler - for readiness probe
+func readinessHandler(w http.ResponseWriter, r *http.Request) {
+	if isKafkaReady() {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Ready"))
+	} else {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte("Not Ready"))
+	}
+}
+
+// isKafkaReady checks if Kafka is ready to serve traffic
+func isKafkaReady() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Create SASL mechanism if credentials are provided
+	var mechanism sasl.Mechanism
+	var err error
+	if c.Proxy.ReadinessUsername != "" && c.Proxy.ReadinessPassword != "" {
+		mechanism, err = scram.Mechanism(scram.SHA512, c.Proxy.ReadinessUsername, c.Proxy.ReadinessPassword)
+		if err != nil {
+			logrus.Infof("Failed to create SASL mechanism: %v", err)
+			return false
+		}
+	}
+
+	// Create dialer with SASL authentication
+	dialer := &kafka.Dialer{
+		Timeout:       5 * time.Second,
+		SASLMechanism: mechanism,
+	}
+
+	// If ReadinessServiceName is set, use it instead of bootstrap servers
+	if c.Proxy.ReadinessServiceName != "" {
+		// Split by comma in case multiple service names are provided
+		readinessServices := strings.Split(c.Proxy.ReadinessServiceName, ",")
+
+		// Try connecting to each service, return true if any succeeds
+		for _, serviceName := range readinessServices {
+			serviceName = strings.TrimSpace(serviceName)
+			if serviceName == "" {
+				continue
+			}
+
+			if checkKafkaConnection(ctx, dialer, serviceName) {
+				return true
+			}
+		}
+
+		// All readiness services failed
+		logrus.Info("All Kafka readiness services are inaccessible")
+		return false
+	}
+
+	// Use bootstrap servers if available
+	if len(c.Proxy.BootstrapServers) > 0 {
+		// Track if at least one server is accessible
+		for _, server := range c.Proxy.BootstrapServers {
+			if checkKafkaConnection(ctx, dialer, server.BrokerAddress) {
+				return true
+			}
+		}
+
+		// All servers are inaccessible
+		logrus.Info("All Kafka bootstrap servers are inaccessible")
+		return false
+	}
+
+	// No bootstrap servers or readiness service configured
+	logrus.Info("No bootstrap servers or readiness service configured, considering ready")
+	return true
+}
+
+// checkKafkaConnection attempts to connect to the provided kafka address and verify it's working
+func checkKafkaConnection(ctx context.Context, dialer *kafka.Dialer, kafkaAddress string) bool {
+	// Create a connection to Kafka
+	conn, err := dialer.DialContext(ctx, "tcp", kafkaAddress)
+	if err != nil {
+		logrus.Infof("Failed to connect to Kafka at %s: %v", kafkaAddress, err)
+		return false
+	}
+	defer conn.Close()
+
+	// Try to get broker metadata - this is a lightweight operation
+	brokers, err := conn.Brokers()
+	if err != nil {
+		logrus.Infof("Failed to get Kafka brokers from %s: %v", kafkaAddress, err)
+		return false
+	}
+
+	if len(brokers) == 0 {
+		logrus.Debugf("No Kafka brokers available from %s", kafkaAddress)
+		return false
+	}
+
+	// Check API versions - this is one of the lightest weight operations
+	// and doesn't require listing all topics/partitions
+	apiVersions, err := conn.ApiVersions()
+	if err != nil {
+		logrus.Infof("Failed to retrieve API versions from %s: %v", kafkaAddress, err)
+		return false
+	}
+
+	logrus.Infof("Kafka at %s is ready - found %d brokers and %d API versions", kafkaAddress, len(brokers), len(apiVersions))
+	return true
+}
+
 func SetLogger() {
+	// Enable caller reporting to include function name and line number
+	logrus.SetReportCaller(true)
+
 	if c.Log.Format == "json" {
 		formatter := &logrus.JSONFormatter{
 			FieldMap: logrus.FieldMap{
 				logrus.FieldKeyTime:  c.Log.TimeFiledName,
 				logrus.FieldKeyLevel: c.Log.LevelFieldName,
 				logrus.FieldKeyMsg:   c.Log.MsgFiledName,
+				logrus.FieldKeyFunc:  "function",
+				logrus.FieldKeyFile:  "file",
 			},
 			TimestampFormat: time.RFC3339,
+			CallerPrettyfier: func(f *runtime.Frame) (string, string) {
+				filename := path.Base(f.File)
+				return fmt.Sprintf("%s()", f.Function), fmt.Sprintf("%s:%d", filename, f.Line)
+			},
 		}
 		logrus.SetFormatter(formatter)
 	} else {
-		logrus.SetFormatter(&logrus.TextFormatter{FullTimestamp: true})
+		logrus.SetFormatter(&logrus.TextFormatter{
+			FullTimestamp: true,
+			CallerPrettyfier: func(f *runtime.Frame) (string, string) {
+				filename := path.Base(f.File)
+				return fmt.Sprintf("%s()", f.Function), fmt.Sprintf("%s:%d", filename, f.Line)
+			},
+		})
 	}
 	level, err := logrus.ParseLevel(c.Log.Level)
 	if err != nil {

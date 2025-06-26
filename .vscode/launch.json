@@ -1,0 +1,25 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    
+    {
+      "name": "Debug Go server",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/main.go",
+      "args": [
+        "server",
+        "--bootstrap-server-mapping", "localhost:9092,0.0.0.0:30001",
+        "--bootstrap-server-mapping", "localhost:9094,0.0.0.0:30002",
+        "--bootstrap-server-mapping", "localhost:9096,0.0.0.0:30003",
+        "--log-format=text",
+        "--log-level=info",
+        "--proxy-shutdown-timeout=60s", 
+        "--proxy-readiness-username", "admin", 
+        "--proxy-readiness-password", "admin-secret",
+        "--proxy-readiness-service-name", "localhost:30001",
+      ]
+    }
+  ]
+}

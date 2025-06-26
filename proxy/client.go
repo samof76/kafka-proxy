@@ -36,12 +36,16 @@ type Client struct {
 	stopRun  chan struct{}
 	stopOnce sync.Once
 
+	wg sync.WaitGroup
+
 	saslAuthByProxy SASLAuthByProxy
 	authClient      *AuthClient
 
 	dialAddressMapping map[string]config.DialAddressMapping
 
 	kafkaClientCert *x509.Certificate
+
+	shutdownTimeout time.Duration
 }
 
 func NewClient(conns *ConnSet, c *config.Config, netAddressMappingFunc config.NetAddressMappingFunc, localPasswordAuthenticator apis.PasswordAuthenticator, localTokenAuthenticator apis.TokenInfo, saslTokenProvider apis.TokenProvider, gatewayTokenProvider apis.TokenProvider, gatewayTokenInfo apis.TokenInfo) (*Client, error) {
@@ -179,6 +183,7 @@ func NewClient(conns *ConnSet, c *config.Config, netAddressMappingFunc config.Ne
 		},
 		dialAddressMapping: dialAddressMapping,
 		kafkaClientCert:    kafkaClientCert,
+		shutdownTimeout:    c.Proxy.ShutdownTimeout,
 	}, nil
 }
 
@@ -253,14 +258,39 @@ STOP:
 	for {
 		select {
 		case conn := <-connSrc:
-			go withRecover(func() { c.handleConn(conn) })
+			c.wg.Add(1)
+			logrus.Infof("New connection from %s", conn.LocalConnection.RemoteAddr().String())
+			go withRecover(func() {
+				c.handleConn(conn)
+				c.wg.Done()
+				logrus.Infof("Connection from %s closed", conn.LocalConnection.RemoteAddr().String())
+			})
 		case <-c.stopRun:
+			logrus.Info("Stopping client")
 			break STOP
 		}
 	}
 
-	logrus.Info("Closing connections")
+	logrus.Infof("Waiting for in-flight connections to drain (timeout: %v)...", c.shutdownTimeout)
 
+	// Wait for connections to drain with timeout
+	done := make(chan struct{})
+	go func() {
+		logrus.Info("Waiting for in-flight connections to drain in Run")
+		c.wg.Wait()
+		logrus.Info("All connections drained in Run")
+		close(done)
+		logrus.Info("Done waiting for in-flight connections to drain in Run")
+	}()
+
+	select {
+	case <-done:
+		logrus.Info("All connections drained gracefully.")
+	case <-time.After(c.shutdownTimeout):
+		logrus.Warnf("Shutdown timeout reached (%v), forcefully closing remaining connections.", c.shutdownTimeout)
+	}
+
+	logrus.Info("Closing connections")
 	if err := c.conns.Close(); err != nil {
 		logrus.Infof("closing client had error: %v", err)
 	}
@@ -273,6 +303,31 @@ func (c *Client) Close() {
 	c.stopOnce.Do(func() {
 		close(c.stopRun)
 	})
+}
+
+// Wait blocks until all in-flight connections are drained or timeout is reached.
+func (c *Client) Wait() {
+	if c.shutdownTimeout <= 0 {
+		logrus.Infof("Waiting for in-flight connections to drain (no timeout) - active connections: %v", c.conns.Count())
+		c.wg.Wait()
+		logrus.Infof("All connections drained (no timeout)")
+		return
+	}
+
+	done := make(chan struct{})
+	go func() {
+		logrus.Infof("Waiting for in-flight connections to drain (timeout) - active connections: %v", c.conns.Count())
+		c.wg.Wait()
+		logrus.Infof("All connections drained (timeout)")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		logrus.Infof("All connections drained gracefully during wait.")
+	case <-time.After(c.shutdownTimeout):
+		logrus.Warnf("Wait timeout reached (%v), proceeding with shutdown. Remaining connections: %v", c.shutdownTimeout, c.conns.Count())
+	}
 }
 
 func (c *Client) handleConn(conn Conn) {

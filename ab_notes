@@ -1,0 +1,27 @@
+meld <(kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config ../scram_admin_client.properties)  <(kafka-broker-api-versions.sh --bootstrap-server localhost:30001 --command-config ../scram_admin_client_proxy.properties)
+
+
+go here ~/Documents/kafka/kafka_multinode/kafka_3_8_0 and start 2 kafka brokers
+
+run proxy 
+
+go run main.go server --bootstrap-server-mapping "localhost:9092,0.0.0.0:30001" --bootstrap-server-mapping "localhost:9094,0.0.0.0:30002" --log-format=text --log-level=info --proxy-shutdown-timeout=60s --proxy-readiness-username admin --proxy-readiness-password admin-secret --proxy-readiness-service-name localhost:30001 --dynamic-advertised-listener 0.0.0.0 --dynamic-sequential-min-port 40000
+
+
+start the third kafka broker
+
+the third broker should be avaiable at localhost:40000 even though it is not listed in the bootstrap-server-mapping due to the dynamic sequential port allocation
+
+
+checkthe api versions of brokers
+
+meld <(kafka-broker-api-versions.sh --bootstrap-server localhost:9092 --command-config ../scram_admin_client.properties)  <(kafka-broker-api-versions.sh --bootstrap-server localhost:30001 --command-config ../scram_admin_client_proxy.properties)
+
+
+
+kafka-topics.sh --bootstrap-server localhost:30001 --create --topic scram --replication-factor 2 --partitions 15 --command-config ./scram_admin_client_proxy.properties 
+
+
+kafka-console-producer.sh --topic scram --bootstrap-server localhost:30001 --compression-codec lz4 --request-required-acks -1 --producer.config ./scram_admin_client_proxy.properties 
+
+kafka-console-consumer.sh --topic scram --bootstrap-server localhost:30001 --from-beginning --consumer.config ./scram_admin_client_proxy.properties
